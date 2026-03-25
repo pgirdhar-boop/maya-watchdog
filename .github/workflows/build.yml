@@ -1,29 +1,44 @@
-name: Build Maya Watchdog
+name: Build Maya Manager
 
-on: [push]
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-    - name: Setup MinGW
+    # Install MSYS2 (stable MinGW environment)
+    - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
       with:
         msystem: MINGW64
-        install: mingw-w64-x86_64-gcc
+        update: true
+        install: >
+          mingw-w64-x86_64-gcc
 
-    - name: Compile
+    # Compile EXE
+    - name: Build Maya Manager
       shell: msys2 {0}
       run: |
-        g++ MayaWatchdog.cpp -o MayaWatchdog.exe \
-        -static -static-libgcc -static-libstdc++ \
-        -lpsapi -mwindows
+        g++ MayaWatchdog.cpp \
+        -o MayaManager.exe \
+        -static \
+        -static-libgcc \
+        -static-libstdc++ \
+        -mwindows \
+        -luser32 \
+        -lgdi32 \
+        -lshell32
 
-    - name: Upload EXE
+    # Upload EXE
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: MayaWatchdog
-        path: MayaWatchdog.exe
+        name: MayaManager
+        path: MayaManager.exe
