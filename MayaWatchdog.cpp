@@ -1,273 +1,179 @@
 #include <windows.h>
-#include <tlhelp32.h>
-#include <vector>
+#include <shellapi.h>
+#include <winsock2.h>
+#include <map>
 #include <string>
+#include <thread>
+#include <chrono>
 
-#define ID_TRAYICON 1001
-#define WM_TRAYICON (WM_USER + 1)
+#pragma comment(lib,"ws2_32.lib")
 
-#define ID_SCAN     2001
-#define ID_CRASH    2002
-#define ID_EXIT     2003
+#define WM_TRAY (WM_USER+1)
 
-NOTIFYICONDATA nid{};
-HWND g_hwnd = NULL;
-
-//////////////////////////////////////////////////////////////
-// Detect maya.exe
-//////////////////////////////////////////////////////////////
-
-bool IsMaya(const char* exe)
+struct Session
 {
-    return _stricmp(exe, "maya.exe") == 0;
+    int port;
+    time_t lastBeat;
+    std::string scene;
+};
+
+std::map<int,Session> sessions;
+HWND hwnd;
+NOTIFYICONDATA nid;
+
+////////////////////////////////////////////////////
+
+void UpdateTray(int state)
+{
+    // 0 green,1 yellow,2 red
+    nid.hIcon = LoadIcon(NULL,
+        state==0?IDI_APPLICATION:
+        state==1?IDI_WARNING:
+                 IDI_ERROR);
+
+    Shell_NotifyIcon(NIM_MODIFY,&nid);
 }
 
-std::vector<DWORD> GetMayaPIDs()
+////////////////////////////////////////////////////
+
+std::string SendCmd(int port,const char* cmd)
 {
-    std::vector<DWORD> result;
+    SOCKET s=socket(AF_INET,SOCK_STREAM,0);
 
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE)
-        return result;
+    sockaddr_in addr{};
+    addr.sin_family=AF_INET;
+    addr.sin_port=htons(port);
+    addr.sin_addr.s_addr=inet_addr("127.0.0.1");
 
-    PROCESSENTRY32 pe{};
-    pe.dwSize = sizeof(pe);
+    if(connect(s,(sockaddr*)&addr,sizeof(addr))<0)
+        return "";
 
-    if (Process32First(snap, &pe))
+    send(s,cmd,strlen(cmd),0);
+
+    char buf[1024]={0};
+    recv(s,buf,1024,0);
+
+    closesocket(s);
+    return buf;
+}
+
+////////////////////////////////////////////////////
+
+void HeartbeatServer()
+{
+    WSADATA w;
+    WSAStartup(MAKEWORD(2,2),&w);
+
+    SOCKET server=socket(AF_INET,SOCK_STREAM,0);
+
+    sockaddr_in addr{};
+    addr.sin_family=AF_INET;
+    addr.sin_port=htons(50500);
+    addr.sin_addr.s_addr=INADDR_ANY;
+
+    bind(server,(sockaddr*)&addr,sizeof(addr));
+    listen(server,10);
+
+    while(true)
     {
-        do
+        SOCKET c=accept(server,NULL,NULL);
+
+        char buf[64]={0};
+        recv(c,buf,64,0);
+
+        int port=atoi(buf);
+
+        sessions[port].port=port;
+        sessions[port].lastBeat=time(NULL);
+
+        closesocket(c);
+    }
+}
+
+////////////////////////////////////////////////////
+
+void Monitor()
+{
+    while(true)
+    {
+        time_t now=time(NULL);
+
+        int state=0;
+
+        for(auto&[p,s]:sessions)
         {
-            if (IsMaya(pe.szExeFile))
-                result.push_back(pe.th32ProcessID);
+            int diff=int(now-s.lastBeat);
 
-        } while (Process32Next(snap, &pe));
-    }
+            if(diff>12)
+            {
+                state=2;
 
-    CloseHandle(snap);
-    return result;
-}
+                std::string scene=SendCmd(p,"PING");
 
-//////////////////////////////////////////////////////////////
-// SAFE CRASH (CREATES MAYA RECOVERY FILE)
-//////////////////////////////////////////////////////////////
+                std::string msg=
+                    "Frozen Maya detected:\n\n"+scene+
+                    "\n\nRecover?";
 
-void CrashMaya(DWORD pid)
-{
-    HANDLE process = OpenProcess(
-        PROCESS_CREATE_THREAD |
-        PROCESS_VM_OPERATION |
-        PROCESS_VM_WRITE,
-        FALSE,
-        pid);
+                if(MessageBox(NULL,msg.c_str(),
+                    "Studio Watchdog",
+                    MB_YESNO|MB_ICONWARNING)==IDYES)
+                {
+                    std::string path=SendCmd(p,"SAVE");
 
-    if (!process)
-        return;
-
-    // Access violation stub (forces Maya crash handler)
-    unsigned char crashCode[] =
-    {
-        0x48,0x31,0xC0, // xor rax,rax
-        0x48,0x8B,0x00, // mov rax,[rax]
-        0xC3            // ret
-    };
-
-    LPVOID remote =
-        VirtualAllocEx(process,
-            NULL,
-            sizeof(crashCode),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE);
-
-    if (!remote)
-    {
-        CloseHandle(process);
-        return;
-    }
-
-    WriteProcessMemory(
-        process,
-        remote,
-        crashCode,
-        sizeof(crashCode),
-        NULL);
-
-    HANDLE thread =
-        CreateRemoteThread(
-            process,
-            NULL,
-            0,
-            (LPTHREAD_START_ROUTINE)remote,
-            NULL,
-            0,
-            NULL);
-
-    if (thread)
-        CloseHandle(thread);
-
-    CloseHandle(process);
-}
-
-//////////////////////////////////////////////////////////////
-// UI HELPERS
-//////////////////////////////////////////////////////////////
-
-void ShowMessage(const char* text)
-{
-    MessageBoxA(NULL, text, "Maya Watchdog", MB_OK | MB_ICONINFORMATION);
-}
-
-void ScanMaya()
-{
-    auto pids = GetMayaPIDs();
-
-    if (pids.empty())
-    {
-        ShowMessage("No running Maya sessions found.");
-        return;
-    }
-
-    std::string msg = "Running Maya Sessions:\n\n";
-
-    for (DWORD pid : pids)
-        msg += "PID: " + std::to_string(pid) + "\n";
-
-    MessageBoxA(NULL, msg.c_str(), "Maya Sessions", MB_OK);
-}
-
-void ConfirmCrash()
-{
-    auto pids = GetMayaPIDs();
-
-    if (pids.empty())
-    {
-        ShowMessage("No Maya sessions running.");
-        return;
-    }
-
-    for (DWORD pid : pids)
-    {
-        std::string msg =
-            "Crash Maya PID " + std::to_string(pid) +
-            "?\n\n(A recovery file will be created)";
-
-        int res = MessageBoxA(
-            NULL,
-            msg.c_str(),
-            "Confirm Crash",
-            MB_YESNO | MB_ICONWARNING);
-
-        if (res == IDYES)
-            CrashMaya(pid);
-    }
-}
-
-//////////////////////////////////////////////////////////////
-// TRAY MENU
-//////////////////////////////////////////////////////////////
-
-void ShowTrayMenu()
-{
-    POINT pt;
-    GetCursorPos(&pt);
-
-    HMENU menu = CreatePopupMenu();
-
-    InsertMenu(menu, -1, MF_BYPOSITION, ID_SCAN,  "Scan Maya Sessions");
-    InsertMenu(menu, -1, MF_BYPOSITION, ID_CRASH, "Crash Frozen Maya");
-    InsertMenu(menu, -1, MF_SEPARATOR, 0, NULL);
-    InsertMenu(menu, -1, MF_BYPOSITION, ID_EXIT,  "Exit");
-
-    SetForegroundWindow(g_hwnd);
-
-    TrackPopupMenu(
-        menu,
-        TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-        pt.x,
-        pt.y,
-        0,
-        g_hwnd,
-        NULL);
-
-    DestroyMenu(menu);
-}
-
-//////////////////////////////////////////////////////////////
-// WINDOW PROC
-//////////////////////////////////////////////////////////////
-
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    switch (msg)
-    {
-    case WM_COMMAND:
-        switch (LOWORD(wParam))
-        {
-        case ID_SCAN:
-            ScanMaya();
-            break;
-
-        case ID_CRASH:
-            ConfirmCrash();
-            break;
-
-        case ID_EXIT:
-            Shell_NotifyIcon(NIM_DELETE, &nid);
-            PostQuitMessage(0);
-            break;
+                    MessageBox(NULL,
+                        ("Saved:\n"+path).c_str(),
+                        "Recovery Complete",
+                        MB_OK);
+                }
+            }
+            else if(diff>6)
+                state=max(state,1);
         }
-        break;
 
-    case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP)
-            ShowTrayMenu();
-        break;
+        UpdateTray(state);
 
-    case WM_DESTROY:
-        Shell_NotifyIcon(NIM_DELETE, &nid);
-        PostQuitMessage(0);
-        break;
+        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-//////////////////////////////////////////////////////////////
-// ENTRY
-//////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
+LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l)
 {
-    WNDCLASSA wc{};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = "MayaWatchdog";
+    if(m==WM_TRAY && l==WM_RBUTTONUP)
+        PostQuitMessage(0);
 
-    RegisterClassA(&wc);
+    return DefWindowProc(h,m,w,l);
+}
 
-    g_hwnd = CreateWindowA(
-        "MayaWatchdog",
-        "",
-        0,
-        0,0,0,0,
-        NULL,NULL,hInst,NULL);
+////////////////////////////////////////////////////
 
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = g_hwnd;
-    nid.uID = ID_TRAYICON;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
+{
+    WNDCLASS wc{};
+    wc.lpfnWndProc=Proc;
+    wc.lpszClassName="StudioWatchdog";
+    RegisterClass(&wc);
 
-    strcpy_s(nid.szTip, "Maya Watchdog");
+    hwnd=CreateWindow("StudioWatchdog","",
+        0,0,0,0,0,0,0,hInst,0);
 
-    Shell_NotifyIcon(NIM_ADD, &nid);
+    nid.cbSize=sizeof(nid);
+    nid.hWnd=hwnd;
+    nid.uID=1;
+    nid.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP;
+    nid.uCallbackMessage=WM_TRAY;
+    nid.hIcon=LoadIcon(NULL,IDI_APPLICATION);
+    strcpy_s(nid.szTip,"Studio Maya Watchdog");
+
+    Shell_NotifyIcon(NIM_ADD,&nid);
+
+    std::thread(HeartbeatServer).detach();
+    std::thread(Monitor).detach();
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
+    while(GetMessage(&msg,NULL,0,0))
         DispatchMessage(&msg);
-    }
 
     return 0;
 }
