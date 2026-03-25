@@ -13,26 +13,31 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup MinGW (64-bit)
-      uses: egor-tensin/setup-mingw@v2
+    # Install MSYS2 (stable MinGW environment)
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
       with:
-        platform: x64
+        msystem: MINGW64
+        update: true
+        install: mingw-w64-x86_64-gcc
 
-    - name: Build Maya Manager
-      shell: cmd
+    # Build executable
+    - name: Compile Maya Manager
+      shell: msys2 {0}
       run: |
-        g++ MayaWatchdog.cpp ^
-        -o MayaManager.exe ^
-        -static ^
-        -static-libgcc ^
-        -static-libstdc++ ^
-        -mwindows ^
-        -lws2_32 ^
-        -luser32 ^
-        -lgdi32 ^
+        g++ MayaWatchdog.cpp \
+        -o MayaManager.exe \
+        -static \
+        -static-libgcc \
+        -static-libstdc++ \
+        -mwindows \
+        -lws2_32 \
+        -luser32 \
+        -lgdi32 \
         -lshell32
 
-    - name: Upload EXE Artifact
+    # Upload result
+    - name: Upload EXE
       uses: actions/upload-artifact@v4
       with:
         name: MayaManager
