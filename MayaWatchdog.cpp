@@ -2,17 +2,18 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <string>
-#include <vector>
 #include <map>
 
 #pragma comment(lib, "psapi.lib")
 
-// ---------------- SETTINGS ----------------
+// --------------------------------------------------
+// SETTINGS
+// --------------------------------------------------
 
 const int CHECK_INTERVAL_MS = 5000;
 const int STARTUP_GRACE_SEC = 60;
 
-// ------------------------------------------
+// --------------------------------------------------
 
 struct MayaSession
 {
@@ -23,11 +24,23 @@ struct MayaSession
 
 std::map<DWORD, MayaSession> sessions;
 
-// ------------------------------------------------------------
-// Find Maya main window
-// ------------------------------------------------------------
+// --------------------------------------------------
+// CRASH PAYLOAD (must be GLOBAL, not inside function)
+// --------------------------------------------------
 
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam)
+DWORD WINAPI CrashThread(LPVOID)
+{
+    // intentional access violation
+    volatile int* p = nullptr;
+    *p = 0;
+    return 0;
+}
+
+// --------------------------------------------------
+// ENUM WINDOWS
+// --------------------------------------------------
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
 {
     DWORD pid;
     GetWindowThreadProcessId(hwnd, &pid);
@@ -37,43 +50,44 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam)
 
     if (strstr(title, "Autodesk Maya"))
     {
-        MayaSession session;
-        session.pid = pid;
-        session.hwnd = hwnd;
-        session.startTick = GetTickCount();
+        MayaSession s;
+        s.pid = pid;
+        s.hwnd = hwnd;
+        s.startTick = GetTickCount();
 
-        sessions[pid] = session;
+        sessions[pid] = s;
     }
     return TRUE;
 }
 
-// ------------------------------------------------------------
-// Get CPU usage snapshot
-// ------------------------------------------------------------
+// --------------------------------------------------
+// CPU IDLE CHECK
+// --------------------------------------------------
 
 bool IsCpuIdle(DWORD pid)
 {
     HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!process) return false;
 
-    FILETIME ftCreation, ftExit, ftKernel1, ftUser1;
-    FILETIME ftKernel2, ftUser2;
+    FILETIME c,e,k1,u1,k2,u2;
 
-    GetProcessTimes(process, &ftCreation, &ftExit, &ftKernel1, &ftUser1);
+    GetProcessTimes(process,&c,&e,&k1,&u1);
     Sleep(500);
-    GetProcessTimes(process, &ftCreation, &ftExit, &ftKernel2, &ftUser2);
+    GetProcessTimes(process,&c,&e,&k2,&u2);
 
-    ULONGLONG k1 = ((ULONGLONG)ftKernel1.dwHighDateTime << 32) | ftKernel1.dwLowDateTime;
-    ULONGLONG k2 = ((ULONGLONG)ftKernel2.dwHighDateTime << 32) | ftKernel2.dwLowDateTime;
+    ULONGLONG a =
+        ((ULONGLONG)k1.dwHighDateTime<<32)|k1.dwLowDateTime;
+    ULONGLONG b =
+        ((ULONGLONG)k2.dwHighDateTime<<32)|k2.dwLowDateTime;
 
     CloseHandle(process);
 
-    return (k2 - k1) < 10000;
+    return (b-a) < 10000;
 }
 
-// ------------------------------------------------------------
-// Extract Maya opened file
-// ------------------------------------------------------------
+// --------------------------------------------------
+// GET WINDOW TITLE (SCENE NAME)
+// --------------------------------------------------
 
 std::string GetWindowTitle(HWND hwnd)
 {
@@ -82,48 +96,29 @@ std::string GetWindowTitle(HWND hwnd)
     return std::string(title);
 }
 
-// ------------------------------------------------------------
-// Crash Maya safely (creates recovery file)
-// ------------------------------------------------------------
+// --------------------------------------------------
+// SAFE CRASH (creates Maya recovery)
+// --------------------------------------------------
 
 bool CrashPid(DWORD pid)
 {
-    HANDLE process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    HANDLE process =
+        OpenProcess(PROCESS_CREATE_THREAD |
+                    PROCESS_VM_OPERATION |
+                    PROCESS_VM_WRITE,
+                    FALSE, pid);
+
     if (!process) return false;
 
-    void crash()
-    {
-        *((int*)0) = 0;
-    }
-
-    LPVOID mem = VirtualAllocEx(
-        process,
-        NULL,
-        256,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE);
-
-    if (!mem)
-    {
-        CloseHandle(process);
-        return false;
-    }
-
-    WriteProcessMemory(
-        process,
-        mem,
-        reinterpret_cast<LPCVOID>(crash),
-        256,
-        NULL);
-
-    HANDLE thread = CreateRemoteThread(
-        process,
-        NULL,
-        0,
-        (LPTHREAD_START_ROUTINE)mem,
-        NULL,
-        0,
-        NULL);
+    HANDLE thread =
+        CreateRemoteThread(
+            process,
+            NULL,
+            0,
+            CrashThread,
+            NULL,
+            0,
+            NULL);
 
     if (thread) CloseHandle(thread);
 
@@ -131,15 +126,15 @@ bool CrashPid(DWORD pid)
     return true;
 }
 
-// ------------------------------------------------------------
-// Confirmation dialog
-// ------------------------------------------------------------
+// --------------------------------------------------
+// CONFIRMATION DIALOG
+// --------------------------------------------------
 
-bool AskUser(std::string name)
+bool AskUser(const std::string& title)
 {
     std::string msg =
         "Maya appears frozen:\n\n" +
-        name +
+        title +
         "\n\nCrash Maya and create recovery file?";
 
     int result = MessageBoxA(
@@ -151,72 +146,71 @@ bool AskUser(std::string name)
     return result == IDYES;
 }
 
-// ------------------------------------------------------------
-// Detect running maya.exe
-// ------------------------------------------------------------
+// --------------------------------------------------
+// SCAN MAYA
+// --------------------------------------------------
 
-void ScanMayaProcesses()
+void ScanMaya()
 {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    HANDLE snap =
+        CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+
     PROCESSENTRY32 pe;
     pe.dwSize = sizeof(pe);
 
-    if (Process32First(snap, &pe))
+    if(Process32First(snap,&pe))
     {
         do
         {
-            if (_stricmp(pe.szExeFile, "maya.exe") == 0)
+            if(!_stricmp(pe.szExeFile,"maya.exe"))
             {
-                if (sessions.find(pe.th32ProcessID) == sessions.end())
-                {
-                    EnumWindows(EnumWindowsProc, 0);
-                }
+                EnumWindows(EnumWindowsProc,0);
             }
         }
-        while (Process32Next(snap, &pe));
+        while(Process32Next(snap,&pe));
     }
 
     CloseHandle(snap);
 }
 
-// ------------------------------------------------------------
-// MAIN LOOP
-// ------------------------------------------------------------
+// --------------------------------------------------
+// MAIN
+// --------------------------------------------------
 
-int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+int WINAPI WinMain(HINSTANCE,HINSTANCE,LPSTR,int)
 {
     MessageBoxA(NULL,
         "Maya Watchdog running in background.",
         "Maya Watchdog",
-        MB_OK | MB_ICONINFORMATION);
+        MB_OK|MB_ICONINFORMATION);
 
-    while (true)
+    while(true)
     {
-        ScanMayaProcesses();
+        ScanMaya();
 
-        for (auto& it : sessions)
+        for(auto& it : sessions)
         {
             MayaSession& s = it.second;
 
-            // Ignore startup phase
-            DWORD aliveTime =
-                (GetTickCount() - s.startTick) / 1000;
+            DWORD alive =
+                (GetTickCount()-s.startTick)/1000;
 
-            if (aliveTime < STARTUP_GRACE_SEC)
+            if(alive < STARTUP_GRACE_SEC)
                 continue;
 
-            if (!IsWindow(s.hwnd))
+            if(!IsWindow(s.hwnd))
                 continue;
 
-            if (!IsHungAppWindow(s.hwnd))
+            if(!IsHungAppWindow(s.hwnd))
                 continue;
 
-            if (!IsCpuIdle(s.pid))
+            if(!IsCpuIdle(s.pid))
                 continue;
 
-            std::string title = GetWindowTitle(s.hwnd);
+            std::string title =
+                GetWindowTitle(s.hwnd);
 
-            if (AskUser(title))
+            if(AskUser(title))
                 CrashPid(s.pid);
         }
 
