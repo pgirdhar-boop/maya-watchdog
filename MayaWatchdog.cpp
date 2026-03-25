@@ -1,268 +1,187 @@
-#include <winsock2.h>
+#include <winsock2.h>   // must be before windows.h
 #include <windows.h>
-#include <shellapi.h>
 #include <tlhelp32.h>
-#include <string>
+#include <iostream>
 #include <vector>
-#include <fstream>
+#include <string>
 
-#pragma comment(lib,"ws2_32.lib")
+#pragma comment(lib, "user32.lib")
 
-#define WM_TRAYICON (WM_USER + 1)
+// ------------------------------------------------------------
+// CONFIG
+// ------------------------------------------------------------
+const int CHECK_INTERVAL_MS = 5000;   // check every 5 sec
+const int HUNG_TIMEOUT_MS   = 2000;   // UI response timeout
 
-struct MayaInstance
+// ------------------------------------------------------------
+// Reliable Freeze Detection (Studio Method)
+// ------------------------------------------------------------
+bool IsWindowReallyHung(HWND hwnd)
 {
-    HWND hwnd;
-    DWORD pid;
-    int hangSeconds;
-};
+    DWORD_PTR result = 0;
 
-std::vector<MayaInstance> g_mayas;
-HWND g_hwnd;
-NOTIFYICONDATA nid{};
-
-// ------------------------------------------------
-// SIMPLE LOGGER
-// ------------------------------------------------
-void Log(const std::string& msg)
-{
-    std::ofstream f("MayaWatchdog.log", std::ios::app);
-    f << msg << "\n";
-}
-
-// ------------------------------------------------
-// CHECK IF WINDOW BELONGS TO MAYA
-// ------------------------------------------------
-bool IsMayaProcess(DWORD pid)
-{
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    PROCESSENTRY32 pe{};
-    pe.dwSize = sizeof(pe);
-
-    if (Process32First(snap, &pe))
-    {
-        do {
-            if (pe.th32ProcessID == pid)
-            {
-                std::string name = pe.szExeFile;
-                CloseHandle(snap);
-
-                return name.find("maya") != std::string::npos;
-            }
-        } while (Process32Next(snap, &pe));
-    }
-
-    CloseHandle(snap);
-    return false;
-}
-
-// ------------------------------------------------
-// ENUM WINDOWS → FIND MAYA WINDOWS
-// ------------------------------------------------
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM)
-{
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-
-    if (!IsWindowVisible(hwnd))
-        return TRUE;
-
-    if (IsMayaProcess(pid))
-    {
-        MayaInstance m{};
-        m.hwnd = hwnd;
-        m.pid = pid;
-        m.hangSeconds = 0;
-
-        g_mayas.push_back(m);
-    }
-
-    return TRUE;
-}
-
-void ScanMaya()
-{
-    g_mayas.clear();
-    EnumWindows(EnumWindowsProc, 0);
-}
-
-// ------------------------------------------------
-// HANG TEST
-// ------------------------------------------------
-bool IsHung(HWND hwnd)
-{
-    DWORD_PTR result;
-
-    return !SendMessageTimeout(
+    LRESULT res = SendMessageTimeout(
         hwnd,
         WM_NULL,
         0,
         0,
         SMTO_ABORTIFHUNG,
-        1500,
-        &result);
+        HUNG_TIMEOUT_MS,
+        &result
+    );
+
+    return res == 0;
 }
 
-// ------------------------------------------------
-// AUTOSAVE VIA COMMANDPORT
-// ------------------------------------------------
-void AttemptAutoSave()
+// ------------------------------------------------------------
+// Kill Process By PID
+// ------------------------------------------------------------
+bool KillProcess(DWORD pid)
 {
-    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (!hProcess)
+        return false;
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(7002);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    TerminateProcess(hProcess, 1);
+    CloseHandle(hProcess);
+    return true;
+}
 
-    if (connect(s, (sockaddr*)&addr, sizeof(addr)) == 0)
+// ------------------------------------------------------------
+// Restart Maya
+// (Uses system PATH maya.exe)
+// ------------------------------------------------------------
+void RestartMaya()
+{
+    STARTUPINFO si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+
+    if (CreateProcess(
+            NULL,
+            (LPSTR)"maya.exe",
+            NULL, NULL, FALSE,
+            0, NULL, NULL,
+            &si, &pi))
     {
-        const char* cmd =
-            "import maya.cmds as cmds;"
-            "cmds.file(save=True, force=True)\n";
-
-        send(s, cmd, (int)strlen(cmd), 0);
-        Log("Autosave command sent.");
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        std::cout << "[Watchdog] Maya restarted.\n";
     }
-
-    closesocket(s);
-}
-
-// ------------------------------------------------
-// RECOVERY LADDER
-// ------------------------------------------------
-void Recover(MayaInstance& maya)
-{
-    Log("Attempt recovery.");
-
-    AttemptAutoSave();
-    Sleep(3000);
-
-    SendMessageTimeout(
-        maya.hwnd,
-        WM_CLOSE,
-        0,
-        0,
-        SMTO_ABORTIFHUNG,
-        3000,
-        NULL);
-
-    Sleep(4000);
-
-    if (IsHung(maya.hwnd))
+    else
     {
-        Log("Force terminating Maya.");
-
-        HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, maya.pid);
-        if (p)
-        {
-            TerminateProcess(p, 1);
-            CloseHandle(p);
-        }
+        std::cout << "[Watchdog] Failed to restart Maya.\n";
     }
 }
 
-// ------------------------------------------------
-// WATCHDOG LOOP
-// ------------------------------------------------
-void Monitor()
+// ------------------------------------------------------------
+// Collect all maya.exe PIDs
+// ------------------------------------------------------------
+std::vector<DWORD> GetMayaProcesses()
 {
-    ScanMaya();
+    std::vector<DWORD> pids;
 
-    for (auto& m : g_mayas)
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE)
+        return pids;
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
+
+    if (Process32First(snapshot, &pe))
     {
-        if (IsHung(m.hwnd))
+        do
         {
-            m.hangSeconds += 2;
-
-            if (m.hangSeconds >= 8)
+            if (_stricmp(pe.szExeFile, "maya.exe") == 0)
             {
-                Log("Freeze detected.");
-                Recover(m);
+                pids.push_back(pe.th32ProcessID);
             }
         }
+        while (Process32Next(snapshot, &pe));
     }
+
+    CloseHandle(snapshot);
+    return pids;
 }
 
-// ------------------------------------------------
-// TRAY ICON
-// ------------------------------------------------
-void AddTrayIcon(HWND hwnd)
+// ------------------------------------------------------------
+// Find main window for PID
+// ------------------------------------------------------------
+struct HandleData
 {
-    nid.cbSize = sizeof(nid);
-    nid.hWnd = hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    DWORD pid;
+    HWND hwnd;
+};
 
-    strcpy_s(nid.szTip, "Maya Watchdog");
+BOOL CALLBACK EnumWindowsCallback(HWND hwnd, LPARAM lParam)
+{
+    HandleData& data = *(HandleData*)lParam;
 
-    Shell_NotifyIcon(NIM_ADD, &nid);
+    DWORD windowPid;
+    GetWindowThreadProcessId(hwnd, &windowPid);
+
+    if (windowPid != data.pid)
+        return TRUE;
+
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+
+    data.hwnd = hwnd;
+    return FALSE;
 }
 
-// ------------------------------------------------
-// WINDOW PROC
-// ------------------------------------------------
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg,
-    WPARAM wParam, LPARAM lParam)
+HWND FindMainWindow(DWORD pid)
 {
-    switch (msg)
+    HandleData data;
+    data.pid = pid;
+    data.hwnd = NULL;
+
+    EnumWindows(EnumWindowsCallback, (LPARAM)&data);
+    return data.hwnd;
+}
+
+// ------------------------------------------------------------
+// Watchdog Loop
+// ------------------------------------------------------------
+void WatchdogLoop()
+{
+    std::cout << "Maya Watchdog started...\n";
+
+    while (true)
     {
-    case WM_CREATE:
-        AddTrayIcon(hwnd);
-        SetTimer(hwnd, 1, 2000, NULL);
-        break;
+        std::vector<DWORD> mayaPids = GetMayaProcesses();
 
-    case WM_TIMER:
-        Monitor();
-        break;
+        for (DWORD pid : mayaPids)
+        {
+            HWND hwnd = FindMainWindow(pid);
+            if (!hwnd)
+                continue;
 
-    case WM_DESTROY:
-        Shell_NotifyIcon(NIM_DELETE, &nid);
-        PostQuitMessage(0);
-        break;
+            if (IsWindowReallyHung(hwnd))
+            {
+                std::cout << "[Watchdog] Frozen Maya detected (PID "
+                          << pid << ")\n";
+
+                if (KillProcess(pid))
+                {
+                    std::cout << "[Watchdog] Maya terminated.\n";
+                    Sleep(2000);
+                    RestartMaya();
+                }
+            }
+        }
+
+        Sleep(CHECK_INTERVAL_MS);
     }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// ------------------------------------------------
-// ENTRY POINT
-// ------------------------------------------------
-int WINAPI WinMain(HINSTANCE hInst,
-    HINSTANCE, LPSTR, int)
+// ------------------------------------------------------------
+// Entry Point
+// ------------------------------------------------------------
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2,2), &wsa);
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
 
-    WNDCLASS wc{};
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = "MayaWatchdogClass";
-
-    RegisterClass(&wc);
-
-    g_hwnd = CreateWindowEx(
-        0,
-        wc.lpszClassName,
-        "",
-        WS_OVERLAPPEDWINDOW,
-        0,0,0,0,
-        NULL,
-        NULL,
-        hInst,
-        NULL);
-
-    ShowWindow(g_hwnd, SW_HIDE);
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    WSACleanup();
+    WatchdogLoop();
     return 0;
 }
