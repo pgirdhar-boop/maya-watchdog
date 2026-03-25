@@ -9,9 +9,11 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    # Checkout repository
+    - name: Checkout source
+      uses: actions/checkout@v4
 
-    # Install MSYS2 (modern MinGW)
+    # Install MSYS2 + MinGW64
     - name: Setup MSYS2
       uses: msys2/setup-msys2@v2
       with:
@@ -20,15 +22,20 @@ jobs:
         install: >-
           mingw-w64-x86_64-gcc
 
-    # Compile
-    - name: Build EXE
+    # Compile STATIC executable (no DLL dependency)
+    - name: Build MayaWatchdog.exe
       shell: msys2 {0}
       run: |
         g++ MayaWatchdog.cpp -o MayaWatchdog.exe \
+          -static \
+          -static-libgcc \
+          -static-libstdc++ \
           -mwindows \
           -luser32 -lgdi32 -lshell32 -lws2_32
 
-    # Upload executable
+        strip MayaWatchdog.exe
+
+    # Upload compiled EXE
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
