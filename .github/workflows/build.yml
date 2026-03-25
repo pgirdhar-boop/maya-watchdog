@@ -1,8 +1,7 @@
-name: Build MayaWatchdog EXE
+name: Build MayaWatchdog
 
 on:
   push:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -10,25 +9,28 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 1️⃣ Checkout repo
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-      # 2️⃣ Install MinGW (g++)
-      - name: Install MinGW
-        uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
+    # Install MSYS2 (modern MinGW)
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-gcc
 
-      # 3️⃣ Compile EXE
-      - name: Build MayaWatchdog
-        shell: powershell
-        run: |
-          g++ MayaWatchdog.cpp -o MayaWatchdog.exe -mwindows -luser32 -lgdi32 -lshell32 -lws2_32
+    # Compile
+    - name: Build EXE
+      shell: msys2 {0}
+      run: |
+        g++ MayaWatchdog.cpp -o MayaWatchdog.exe \
+          -mwindows \
+          -luser32 -lgdi32 -lshell32 -lws2_32
 
-      # 4️⃣ Upload EXE as downloadable artifact
-      - name: Upload EXE
-        uses: actions/upload-artifact@v4
-        with:
-          name: MayaWatchdog
-          path: MayaWatchdog.exe
+    # Upload executable
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: MayaWatchdog
+        path: MayaWatchdog.exe
