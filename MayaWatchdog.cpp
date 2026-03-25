@@ -10,11 +10,11 @@
 // ------------------------------------------------------------
 // CONFIG
 // ------------------------------------------------------------
-const int CHECK_INTERVAL_MS = 5000;   // check every 5 sec
+const int CHECK_INTERVAL_MS = 5000;   // recheck every 5 sec
 const int HUNG_TIMEOUT_MS   = 2000;   // UI response timeout
 
 // ------------------------------------------------------------
-// Reliable Freeze Detection (Studio Method)
+// Reliable Freeze Detection
 // ------------------------------------------------------------
 bool IsWindowReallyHung(HWND hwnd)
 {
@@ -30,47 +30,45 @@ bool IsWindowReallyHung(HWND hwnd)
         &result
     );
 
-    return res == 0;
+    return res == 0; // timeout = frozen
 }
 
 // ------------------------------------------------------------
-// Kill Process By PID
+// Ask User Confirmation
 // ------------------------------------------------------------
-bool KillProcess(DWORD pid)
+bool AskUserConfirmation(DWORD pid)
 {
-    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-    if (!hProcess)
+    std::string message =
+        "Maya appears to be frozen.\n\n"
+        "PID: " + std::to_string(pid) +
+        "\n\nCrash this Maya instance?";
+
+    int result = MessageBoxA(
+        NULL,
+        message.c_str(),
+        "Maya Watchdog",
+        MB_ICONWARNING | MB_YESNO | MB_TOPMOST | MB_SYSTEMMODAL
+    );
+
+    return result == IDYES;
+}
+
+// ------------------------------------------------------------
+// Crash (Terminate) Maya Process
+// ------------------------------------------------------------
+bool CrashMaya(DWORD pid)
+{
+    HANDLE process = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (!process)
+    {
+        std::cout << "[Watchdog] Failed to open process.\n";
         return false;
-
-    TerminateProcess(hProcess, 1);
-    CloseHandle(hProcess);
-    return true;
-}
-
-// ------------------------------------------------------------
-// Restart Maya
-// (Uses system PATH maya.exe)
-// ------------------------------------------------------------
-void RestartMaya()
-{
-    STARTUPINFO si = { sizeof(si) };
-    PROCESS_INFORMATION pi;
-
-    if (CreateProcess(
-            NULL,
-            (LPSTR)"maya.exe",
-            NULL, NULL, FALSE,
-            0, NULL, NULL,
-            &si, &pi))
-    {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        std::cout << "[Watchdog] Maya restarted.\n";
     }
-    else
-    {
-        std::cout << "[Watchdog] Failed to restart Maya.\n";
-    }
+
+    BOOL ok = TerminateProcess(process, 1);
+    CloseHandle(process);
+
+    return ok;
 }
 
 // ------------------------------------------------------------
@@ -80,31 +78,29 @@ std::vector<DWORD> GetMayaProcesses()
 {
     std::vector<DWORD> pids;
 
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE)
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
         return pids;
 
     PROCESSENTRY32 pe;
     pe.dwSize = sizeof(pe);
 
-    if (Process32First(snapshot, &pe))
+    if (Process32First(snap, &pe))
     {
         do
         {
             if (_stricmp(pe.szExeFile, "maya.exe") == 0)
-            {
                 pids.push_back(pe.th32ProcessID);
-            }
-        }
-        while (Process32Next(snapshot, &pe));
+
+        } while (Process32Next(snap, &pe));
     }
 
-    CloseHandle(snapshot);
+    CloseHandle(snap);
     return pids;
 }
 
 // ------------------------------------------------------------
-// Find main window for PID
+// Find Main Window of Process
 // ------------------------------------------------------------
 struct HandleData
 {
@@ -144,11 +140,11 @@ HWND FindMainWindow(DWORD pid)
 // ------------------------------------------------------------
 void WatchdogLoop()
 {
-    std::cout << "Maya Watchdog started...\n";
+    std::cout << "Maya Watchdog running...\n";
 
     while (true)
     {
-        std::vector<DWORD> mayaPids = GetMayaProcesses();
+        auto mayaPids = GetMayaProcesses();
 
         for (DWORD pid : mayaPids)
         {
@@ -161,11 +157,19 @@ void WatchdogLoop()
                 std::cout << "[Watchdog] Frozen Maya detected (PID "
                           << pid << ")\n";
 
-                if (KillProcess(pid))
+                // Ask every cycle until user decides YES
+                if (AskUserConfirmation(pid))
                 {
-                    std::cout << "[Watchdog] Maya terminated.\n";
-                    Sleep(2000);
-                    RestartMaya();
+                    std::cout << "[Watchdog] User approved crash.\n";
+
+                    if (CrashMaya(pid))
+                        std::cout << "[Watchdog] Maya crashed successfully.\n";
+                    else
+                        std::cout << "[Watchdog] Failed to crash Maya.\n";
+                }
+                else
+                {
+                    std::cout << "[Watchdog] User chose NO. Will retry later.\n";
                 }
             }
         }
