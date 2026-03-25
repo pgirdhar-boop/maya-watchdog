@@ -47,36 +47,39 @@ bool IsWindowFrozen(HWND hwnd)
 }
 
 //////////////////////////////////////////////////////////////
-// Safe Maya crash (creates recovery file)
+// Studio-safe Maya crash (creates recovery file)
 //////////////////////////////////////////////////////////////
 void CrashMaya(DWORD pid)
 {
-    HANDLE process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!process) return;
+    HANDLE process = OpenProcess(
+        PROCESS_CREATE_THREAD |
+        PROCESS_VM_OPERATION |
+        PROCESS_VM_WRITE,
+        FALSE,
+        pid);
 
-    auto crash = []() { *(int*)0 = 0; };
+    if (!process)
+        return;
 
-    LPVOID mem = VirtualAllocEx(process, NULL, 256,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_EXECUTE_READWRITE);
+    // Remote thread entry = RaiseException
+    HMODULE hKernel = GetModuleHandleA("kernel32.dll");
+    if (!hKernel) return;
 
-    if (!mem) return;
+    FARPROC raiseException =
+        GetProcAddress(hKernel, "RaiseException");
 
-    WriteProcessMemory(
-        process,
-        mem,
-        reinterpret_cast<LPCVOID>(crash),
-        256,
-        NULL);
+    if (!raiseException) return;
 
     CreateRemoteThread(
         process,
         NULL,
         0,
-        (LPTHREAD_START_ROUTINE)mem,
-        NULL,
+        (LPTHREAD_START_ROUTINE)raiseException,
+        (LPVOID)0xDEAD,   // exception code
         0,
         NULL);
+
+    CloseHandle(process);
 }
 
 //////////////////////////////////////////////////////////////
