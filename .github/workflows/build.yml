@@ -1,0 +1,22 @@
+name: Build Maya Watchdog
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build EXE
+      run: |
+        g++ MayaWatchdog.cpp -o MayaWatchdog.exe ^
+        -mwindows ^
+        -luser32 -lgdi32 -lshell32 -lws2_32
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: MayaWatchdog
+        path: MayaWatchdog.exe
