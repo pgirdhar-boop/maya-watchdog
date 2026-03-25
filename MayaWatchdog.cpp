@@ -1,43 +1,120 @@
 #include <windows.h>
 #include <tlhelp32.h>
-#include <shellapi.h>
 #include <psapi.h>
 #include <string>
 #include <vector>
-#include <iostream>
+#include <map>
 
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "psapi.lib")
 
-#define WM_TRAYICON (WM_USER + 1)
+// ---------------- SETTINGS ----------------
 
-NOTIFYICONDATA nid;
-HWND g_hwnd;
+const int CHECK_INTERVAL_MS = 5000;
+const int STARTUP_GRACE_SEC = 60;
 
-// ------------------------------------------------------------
-// SAFE CRASH FUNCTION (creates Maya recovery file)
-// ------------------------------------------------------------
-void crash()
+// ------------------------------------------
+
+struct MayaSession
 {
-    *(int*)0 = 0;
+    DWORD pid;
+    HWND hwnd;
+    DWORD startTick;
+};
+
+std::map<DWORD, MayaSession> sessions;
+
+// ------------------------------------------------------------
+// Find Maya main window
+// ------------------------------------------------------------
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam)
+{
+    DWORD pid;
+    GetWindowThreadProcessId(hwnd, &pid);
+
+    char title[512];
+    GetWindowTextA(hwnd, title, sizeof(title));
+
+    if (strstr(title, "Autodesk Maya"))
+    {
+        MayaSession session;
+        session.pid = pid;
+        session.hwnd = hwnd;
+        session.startTick = GetTickCount();
+
+        sessions[pid] = session;
+    }
+    return TRUE;
 }
+
+// ------------------------------------------------------------
+// Get CPU usage snapshot
+// ------------------------------------------------------------
+
+bool IsCpuIdle(DWORD pid)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!process) return false;
+
+    FILETIME ftCreation, ftExit, ftKernel1, ftUser1;
+    FILETIME ftKernel2, ftUser2;
+
+    GetProcessTimes(process, &ftCreation, &ftExit, &ftKernel1, &ftUser1);
+    Sleep(500);
+    GetProcessTimes(process, &ftCreation, &ftExit, &ftKernel2, &ftUser2);
+
+    ULONGLONG k1 = ((ULONGLONG)ftKernel1.dwHighDateTime << 32) | ftKernel1.dwLowDateTime;
+    ULONGLONG k2 = ((ULONGLONG)ftKernel2.dwHighDateTime << 32) | ftKernel2.dwLowDateTime;
+
+    CloseHandle(process);
+
+    return (k2 - k1) < 10000;
+}
+
+// ------------------------------------------------------------
+// Extract Maya opened file
+// ------------------------------------------------------------
+
+std::string GetWindowTitle(HWND hwnd)
+{
+    char title[512];
+    GetWindowTextA(hwnd, title, sizeof(title));
+    return std::string(title);
+}
+
+// ------------------------------------------------------------
+// Crash Maya safely (creates recovery file)
+// ------------------------------------------------------------
 
 bool CrashPid(DWORD pid)
 {
     HANDLE process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!process) return false;
 
+    void crash()
+    {
+        *((int*)0) = 0;
+    }
+
     LPVOID mem = VirtualAllocEx(
-        process, NULL, 256,
-        MEM_RESERVE | MEM_COMMIT,
+        process,
+        NULL,
+        256,
+        MEM_COMMIT | MEM_RESERVE,
         PAGE_EXECUTE_READWRITE);
 
-    if (!mem) {
+    if (!mem)
+    {
         CloseHandle(process);
         return false;
     }
 
-    WriteProcessMemory(process, mem, crash, 256, NULL);
+    WriteProcessMemory(
+        process,
+        mem,
+        reinterpret_cast<LPCVOID>(crash),
+        256,
+        NULL);
 
     HANDLE thread = CreateRemoteThread(
         process,
@@ -48,221 +125,103 @@ bool CrashPid(DWORD pid)
         0,
         NULL);
 
-    if (!thread) {
-        CloseHandle(process);
-        return false;
-    }
+    if (thread) CloseHandle(thread);
 
-    CloseHandle(thread);
     CloseHandle(process);
     return true;
 }
 
 // ------------------------------------------------------------
-// CHECK WINDOW RESPONSIVENESS (REAL FREEZE DETECTION)
+// Confirmation dialog
 // ------------------------------------------------------------
-bool IsWindowFrozen(HWND hwnd)
-{
-    DWORD_PTR result;
 
-    LRESULT res = SendMessageTimeout(
-        hwnd,
-        WM_NULL,
-        0,
-        0,
-        SMTO_ABORTIFHUNG,
-        3000,
-        &result);
-
-    return res == 0;
-}
-
-// ------------------------------------------------------------
-// IGNORE MAYA DURING STARTUP
-// ------------------------------------------------------------
-bool IsNewProcess(DWORD pid)
-{
-    HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!h) return false;
-
-    FILETIME create, exit, kernel, user;
-    GetProcessTimes(h, &create, &exit, &kernel, &user);
-    CloseHandle(h);
-
-    ULONGLONG start =
-        ((ULONGLONG)create.dwHighDateTime << 32) |
-        create.dwLowDateTime;
-
-    ULONGLONG now =
-        GetTickCount64() * 10000ULL;
-
-    // ignore first 120 seconds
-    return (now - start) < 1200000000ULL;
-}
-
-// ------------------------------------------------------------
-// GET PROCESS NAME
-// ------------------------------------------------------------
-bool IsMayaProcess(DWORD pid)
-{
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return false;
-
-    char path[MAX_PATH];
-    DWORD size = MAX_PATH;
-
-    bool result = false;
-
-    if (QueryFullProcessImageNameA(h, 0, path, &size))
-    {
-        std::string exe(path);
-        if (exe.find("maya.exe") != std::string::npos)
-            result = true;
-    }
-
-    CloseHandle(h);
-    return result;
-}
-
-// ------------------------------------------------------------
-// CONFIRMATION DIALOG
-// ------------------------------------------------------------
-bool AskConfirmation(DWORD pid)
+bool AskUser(std::string name)
 {
     std::string msg =
-        "Maya appears frozen.\n\nPID: "
-        + std::to_string(pid) +
-        "\n\nCrash Maya to create recovery file?";
+        "Maya appears frozen:\n\n" +
+        name +
+        "\n\nCrash Maya and create recovery file?";
 
-    int r = MessageBoxA(
+    int result = MessageBoxA(
         NULL,
         msg.c_str(),
         "Maya Watchdog",
-        MB_ICONWARNING | MB_YESNO | MB_TOPMOST);
+        MB_YESNO | MB_ICONWARNING | MB_TOPMOST);
 
-    return r == IDYES;
+    return result == IDYES;
 }
 
 // ------------------------------------------------------------
-// ENUM WINDOWS
+// Detect running maya.exe
 // ------------------------------------------------------------
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam)
+
+void ScanMayaProcesses()
 {
-    DWORD pid;
-    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(pe);
 
-    if (!IsMayaProcess(pid))
-        return TRUE;
-
-    if (IsNewProcess(pid))
-        return TRUE;
-
-    if (IsWindowVisible(hwnd) && IsWindowFrozen(hwnd))
+    if (Process32First(snap, &pe))
     {
-        *((DWORD*)lParam) = pid;
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-// ------------------------------------------------------------
-// WATCHDOG LOOP
-// ------------------------------------------------------------
-DWORD WINAPI WatchdogThread(LPVOID)
-{
-    while (true)
-    {
-        DWORD frozenPid = 0;
-
-        EnumWindows(EnumWindowsProc, (LPARAM)&frozenPid);
-
-        if (frozenPid)
+        do
         {
-            if (AskConfirmation(frozenPid))
+            if (_stricmp(pe.szExeFile, "maya.exe") == 0)
             {
-                CrashPid(frozenPid);
-                Sleep(10000); // cooldown
-            }
-            else
-            {
-                Sleep(15000); // retry later
+                if (sessions.find(pe.th32ProcessID) == sessions.end())
+                {
+                    EnumWindows(EnumWindowsProc, 0);
+                }
             }
         }
-
-        Sleep(5000);
+        while (Process32Next(snap, &pe));
     }
 
-    return 0;
+    CloseHandle(snap);
 }
 
 // ------------------------------------------------------------
-// TRAY WINDOW
+// MAIN LOOP
 // ------------------------------------------------------------
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
-    if (msg == WM_TRAYICON && lParam == WM_RBUTTONUP)
+    MessageBoxA(NULL,
+        "Maya Watchdog running in background.",
+        "Maya Watchdog",
+        MB_OK | MB_ICONINFORMATION);
+
+    while (true)
     {
-        HMENU menu = CreatePopupMenu();
-        AppendMenu(menu, MF_STRING, 1, "Exit");
+        ScanMayaProcesses();
 
-        POINT pt;
-        GetCursorPos(&pt);
-        SetForegroundWindow(hwnd);
+        for (auto& it : sessions)
+        {
+            MayaSession& s = it.second;
 
-        int cmd = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD,
-            pt.x, pt.y,
-            0,
-            hwnd,
-            NULL);
+            // Ignore startup phase
+            DWORD aliveTime =
+                (GetTickCount() - s.startTick) / 1000;
 
-        if (cmd == 1)
-            PostQuitMessage(0);
+            if (aliveTime < STARTUP_GRACE_SEC)
+                continue;
+
+            if (!IsWindow(s.hwnd))
+                continue;
+
+            if (!IsHungAppWindow(s.hwnd))
+                continue;
+
+            if (!IsCpuIdle(s.pid))
+                continue;
+
+            std::string title = GetWindowTitle(s.hwnd);
+
+            if (AskUser(title))
+                CrashPid(s.pid);
+        }
+
+        Sleep(CHECK_INTERVAL_MS);
     }
 
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-// ------------------------------------------------------------
-// ENTRY POINT
-// ------------------------------------------------------------
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
-{
-    WNDCLASS wc = {};
-    wc.lpfnWndProc = WndProc;
-    wc.lpszClassName = "MayaWatchdog";
-
-    RegisterClass(&wc);
-
-    g_hwnd = CreateWindow(
-        "MayaWatchdog",
-        "",
-        0,
-        0,0,0,0,
-        NULL,NULL,hInst,NULL);
-
-    nid.cbSize = sizeof(NOTIFYICONDATA);
-    nid.hWnd = g_hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-
-    strcpy_s(nid.szTip, "Maya Watchdog Running");
-
-    Shell_NotifyIcon(NIM_ADD, &nid);
-
-    CreateThread(NULL, 0, WatchdogThread, NULL, 0, NULL);
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    Shell_NotifyIcon(NIM_DELETE, &nid);
     return 0;
 }
