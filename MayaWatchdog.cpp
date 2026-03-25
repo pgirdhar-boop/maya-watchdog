@@ -6,22 +6,21 @@
 #include <fstream>
 #include <thread>
 #include <chrono>
-#include <iostream>
+#include <algorithm>
 
 // ----------------------
-// Utility Logging
+// Logging
 // ----------------------
 std::wstring LogPath()
 {
     wchar_t path[MAX_PATH];
     GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH);
-    std::wstring fullPath = std::wstring(path) + L"\\MayaWatchdog.log";
-    return fullPath;
+    return std::wstring(path) + L"\\MayaWatchdog.log";
 }
 
 void Log(const std::wstring& text)
 {
-    std::wofstream file(LogPath(), std::ios::app);
+    std::wofstream file(LogPath().c_str(), std::ios::app);
     if (file.is_open())
         file << text << std::endl;
 }
@@ -60,15 +59,7 @@ bool CrashPid(DWORD pid)
     HANDLE process = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     if (!process) return false;
 
-    // Trigger a controlled crash
-    // This forces Maya to save recovery backup
-    __try
-    {
-        TerminateProcess(process, 1);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-    }
+    TerminateProcess(process, 1); // simple crash
     CloseHandle(process);
     return true;
 }
@@ -84,9 +75,9 @@ void UpdateTrayIcon(int state)
     nid.uFlags = NIF_ICON | NIF_TIP;
     switch (state)
     {
-    case 0: nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION); break; // Green
-    case 1: nid.hIcon = LoadIconW(nullptr, IDI_WARNING); break;    // Yellow
-    case 2: nid.hIcon = LoadIconW(nullptr, IDI_ERROR); break;      // Red
+    case 0: nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_APPLICATION)); break; // Green
+    case 1: nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_WARNING)); break;    // Yellow
+    case 2: nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_ERROR)); break;      // Red
     }
     Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
@@ -104,8 +95,7 @@ void Monitor()
             UpdateTrayIcon(1); // Yellow if Maya running
             for (auto pid : pids)
             {
-                std::wstring msg = L"Maya PID detected: " + std::to_wstring(pid);
-                Log(msg);
+                Log(L"Maya PID detected: " + std::to_wstring(pid));
 
                 int result = MessageBoxW(nullptr,
                     (L"Crash this Maya process?\nPID: " + std::to_wstring(pid)).c_str(),
@@ -141,7 +131,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP + 1;
-    nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    nid.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(IDI_APPLICATION));
     wcscpy_s(nid.szTip, L"AAA Maya Watchdog");
 
     Shell_NotifyIconW(NIM_ADD, &nid);
